@@ -1,0 +1,4 @@
+# CRUCIBLE — requires Python 3.9–3.11 (Taichi has no wheels for 3.12+/3.14).
+# This project was set up against Python 3.9.13.
+taichi==1.7.4
+numpy
