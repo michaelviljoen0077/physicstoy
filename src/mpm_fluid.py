@@ -1,23 +1,19 @@
-"""CRUCIBLE — Phase 2: two weakly-compressible fluids (colour + density) in a box.
+"""CRUCIBLE — a real-time 3D MLS-MPM physics sandbox (Taichi).
 
 MLS-MPM (Moving Least Squares Material Point Method), the practical/stable
 variant used by the canonical Taichi mpm88/mpm99 examples, extended from 2D to
-3D and specialized to weakly-compressible liquids (volume-ratio J + EOS
-pressure).
-
-Phase 2 — the make-or-break "first slice": each particle carries a
-``material_id`` that selects its rest density (encoded as per-particle mass),
-stiffness, and colour. A heavy fluid is spawned *above* a light one so that
-buoyancy — which falls out of mass + momentum + gravity, nothing scripted —
-drives density layering and Rayleigh-Taylor plumes as the heavy fluid sinks
-through the light one and they swap places.
+3D. Each particle carries a ``material_id`` selecting its constitutive class
+(weakly-compressible liquid, neo-Hookean elastic, Drucker-Prager granular),
+rest density (encoded as per-particle mass), stiffness and colour. Scenes that
+use heat (lava, melt) also diffuse a per-particle temperature through the grid
+and transform materials at temperature thresholds.
 
 Run interactively (opens a GGUI window):
-    python src/mpm_fluid.py
+    python src/mpm_fluid.py [--scene pool|empty|drop|jelly|sand|lava|melt|...]
 
-Run a headless check (no window; asserts no NaN, bounded velocity, and that the
-heavy fluid ends up below the light one):
-    python src/mpm_fluid.py --headless --frames 600
+Run a headless check (no window; asserts no NaN, bounded velocity, and the
+scene's own success criterion):
+    python src/mpm_fluid.py --headless --scene drop --frames 600
 """
 
 import argparse
@@ -29,11 +25,18 @@ import taichi as ti
 # Taichi must be initialized before any field is allocated. Do an early, minimal
 # scan of argv for backend + scene so module-level fields below can be sized.
 def _early_flag(name, default):
-    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+    # Accepts both "--flag value" and "--flag=value". Malformed input falls back
+    # to the default; argparse in main() then reports it properly.
+    for i, a in enumerate(sys.argv):
+        if a == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return default
 
 
 _arch = _early_flag("--arch", "cuda")
-SCENE = _early_flag("--scene", "pool")   # also re-read in main() for validation
+SCENE = _early_flag("--scene", "pool")   # re-read (and validated) in main()
 ti.init(arch=getattr(ti, _arch), default_fp=ti.f32)
 
 # ----------------------------------------------------------------------------
@@ -87,7 +90,8 @@ DT, SUBSTEPS = scene_timestep(SCENE)
 # Heat is only meaningful for scenes whose materials transform. Compiling the
 # whole temperature scatter/diffuse/gather/transform out of the substep when
 # it's unused removes several grid passes + per-particle work.
-HEAT_ON = False   # heat physics removed
+HEAT_SCENES = ("lava", "melt")
+HEAT_ON = SCENE in HEAT_SCENES
 
 P_VOL = (DX * 0.5) ** DIM        # one particle nominally fills 1/8 of a cell
 GRAVITY = 20.0   # stronger-than-earth fall so motion doesn't feel floaty in the
@@ -100,10 +104,6 @@ BOUND = 3                        # wall thickness in grid cells
 #             encoded as per-particle mass, so density layering is emergent.
 #   ELASTIC — neo-Hookean solid using the full deformation gradient F. Wobbles
 #             and bounces; high stiffness ≈ rigid.
-# (GRANULAR — Drucker-Prager — is the next class to be added.)
-#   GRANULAR — Drucker-Prager elastoplastic (sand). Same Hencky elasticity as a
-#              solid, but every step the deformation is projected onto a friction
-#              yield cone, so it piles and slumps at an angle of repose.
 #   GRANULAR — Drucker-Prager elastoplastic (sand). Same Hencky elasticity as a
 #              solid, but every step the deformation is projected onto a friction
 #              yield cone, so it piles and slumps at an angle of repose.
@@ -607,7 +607,6 @@ def seed_sphere(start: ti.i32, count: ti.i32, m: ti.i32,
 # Boundary between the lower (light) and upper (heavy) layers, in domain units.
 INTERFACE_Y = 0.46
 N_LIGHT = N_SIM // 2
-SCENE = "pool"   # import-time placeholder; main() sets it from --scene
 RENDER_MODE = "fluid"   # "fluid" | "surface" | "particles"; overridden by --render
 
 
@@ -787,7 +786,8 @@ def mean_heights():
 
 
 MAT_NAMES = ["light", "heavy", "jelly", "sand", "water",
-             "ice", "steam", "lava", "stone"]
+             "ice", "steam", "lava", "stone", "water_c", "water_p"]
+assert len(MAT_NAMES) == NUM_MAT
 
 
 def counts():
@@ -818,6 +818,9 @@ def run_headless(frames: int) -> int:
             elif SCENE == "sand":
                 print(f"  frame {f:4d}  max|v|={ms:7.3f}  "
                       f"h-extent={h_extent:.4f}  y-extent={extent:.4f}  NaNs={nc}")
+            elif SCENE in ("pool", "empty"):
+                print(f"  frame {f:4d}  max|v|={ms:7.3f}  "
+                      f"water_mean_y={mh[WATER]:.4f}  NaNs={nc}")
             elif SCENE in ("lava", "melt"):
                 cm = counts()
                 peak_steam = max(peak_steam, int(cm[STEAM]))
@@ -892,20 +895,28 @@ def run_headless(frames: int) -> int:
         print(f"FAIL: density layering did not occur "
               f"(light_y={light_y:.4f}, heavy_y={heavy_y:.4f}, gap={gap:+.4f}).")
         return 1
+    if SCENE in ("pool", "empty"):
+        print(f"PASS: stable ({SCENE} scene), max|v|={ms:.3f}.")
+        return 0
     # mixed scene — graded on stability only (cannot demix; see init_scene).
     print(f"PASS (mixed scene): stable; fluids remain mixed as expected "
           f"(light_y={light_y:.4f}, heavy_y={heavy_y:.4f}).")
     return 0
 
 
+@ti.func
+def _glow(base, T):
+    # Temperature -> emission tint so hot material visibly glows white-hot.
+    g = ti.max(0.0, ti.min(1.0, (T - 300.0) / 900.0))
+    return base * (1.0 - g) + ti.Vector([1.0, 0.95, 0.7]) * g
+
+
 @ti.kernel
 def update_render_colors():
-    # Minimal temperature -> emission tint so hot material visibly glows in the
-    # GGUI preview. (Full emissive/refractive shading is Phase 5.)
+    # Refresh per-particle render colour from material + temperature. Needed
+    # every frame in heat scenes (glow tracks temperature) and after a load.
     for p in x:
-        base = mat_color[mat[p]]
-        glow = ti.max(0.0, ti.min(1.0, (temp[p] - 300.0) / 900.0))
-        colors[p] = base * (1.0 - glow) + ti.Vector([1.0, 0.95, 0.7]) * glow
+        colors[p] = _glow(mat_color[mat[p]], temp[p])
 
 
 # ============================================================================
@@ -966,7 +977,7 @@ def update_particle_render():
     # Per-particle render colour, plus push clipped particles off-screen so the
     # cross-section reads (GGUI draws the whole field, so we relocate, not cull).
     for p in x:
-        colors[p] = mat_color[mat[p]]
+        colors[p] = _glow(mat_color[mat[p]], temp[p])
         hidden = active[p] == 0 or _clipped(x[p])
         rpos[p] = ti.Vector([-9.0, -9.0, -9.0]) if hidden else x[p]
 
@@ -1079,9 +1090,7 @@ def _march_cell(I):
             o = ti.Vector(_CORNER[c])
             node = I + o
             cv[c] = rho_r[node]
-            base_col = col_r[node]
-            glow = ti.max(0.0, ti.min(1.0, (tmp_r[node] - 300.0) / 900.0))
-            colv = base_col * (1.0 - glow) + ti.Vector([1.0, 0.95, 0.7]) * glow
+            colv = _glow(col_r[node], tmp_r[node])
             for d in ti.static(range(3)):
                 cpos[c, d] = float(node[d])
                 ccol[c, d] = colv[d]
@@ -1430,8 +1439,11 @@ def render_screenspace(canvas, camera):
     cl = camera.curr_lookat
     cu = camera.curr_up
     _set_view([cp[0], cp[1], cp[2]], [cl[0], cl[1], cl[2]], [cu[0], cu[1], cu[2]])
-    # colours are static (set at spawn) and ss_splat clips on x[p] directly, so
-    # the per-frame update_particle_render() pass isn't needed for fluid render.
+    # ss_splat clips on x[p] directly, so update_particle_render() isn't
+    # needed here. Colours are static (set at spawn/transform) except in heat
+    # scenes, where the glow follows temperature every frame.
+    if HEAT_ON:
+        update_render_colors()
     t = float(np.tan(np.radians(SS_FOV) * 0.5))
     aspect = SS_W / SS_H
     ss_clear()
@@ -1461,22 +1473,28 @@ def save_scene(path: str):
              x=x.to_numpy(), v=v.to_numpy(), C=C.to_numpy(), F=F.to_numpy(),
              J=J.to_numpy(), mass=mass.to_numpy(), mat=mat.to_numpy(),
              temp=temp.to_numpy(), active=active.to_numpy(),
-             n=N_PARTICLES, scene=SCENE)
+             n=N_PARTICLES, n_sim=N_SIM, n_pool=N_POOL, scene=SCENE)
     print(f"  saved scene -> {path} ({N_PARTICLES} particles)")
 
 
 def load_scene(path: str) -> bool:
-    d = np.load(path, allow_pickle=True)
+    import os
+    if not os.path.exists(path):
+        print(f"  !! load skipped: {path} not found (save a scene first)")
+        return False
+    d = np.load(path)
     if int(d["n"]) != N_PARTICLES:
+        hint = (f"--particles {int(d['n_sim'])} --pool {int(d['n_pool'])}"
+                if "n_sim" in d else f"a total of {int(d['n'])} particles")
         print(f"  !! load skipped: file has {int(d['n'])} particles, "
-              f"running with {N_PARTICLES}. Restart with "
-              f"--particles {int(d['n'])}.")
+              f"running with {N_PARTICLES}. Restart with {hint}.")
         return False
     x.from_numpy(d["x"]); v.from_numpy(d["v"]); C.from_numpy(d["C"])
     F.from_numpy(d["F"]); J.from_numpy(d["J"]); mass.from_numpy(d["mass"])
     mat.from_numpy(d["mat"]); temp.from_numpy(d["temp"])
     if "active" in d:
         active.from_numpy(d["active"])
+    update_render_colors()   # colours aren't saved; derive them from mat/temp
     print(f"  loaded scene <- {path}")
     return True
 
@@ -1488,7 +1506,9 @@ def run_saveload_test(frames: int) -> int:
         for _ in range(SUBSTEPS):
             substep()
     before = x.to_numpy().copy()
-    tmp = "._saveload_test.npz"
+    import os
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "crucible_saveload_test.npz")
     save_scene(tmp)
     for _ in range(50):           # perturb the live state
         substep()
@@ -1496,7 +1516,6 @@ def run_saveload_test(frames: int) -> int:
     ok = load_scene(tmp)
     after = x.to_numpy()
     restored = float(np.abs(after - before).max())
-    import os
     os.remove(tmp)
     print(f"  perturbation moved particles by {moved:.4f}; after reload "
           f"max diff = {restored:.2e}")
@@ -1557,13 +1576,16 @@ def _render_scene(scene, camera, render_mode):
         scene.particles(rpos, radius=0.006, per_vertex_color=colors)
 
 
-def run_gui(frames: int):
+def run_gui(frames: int, snapshot: str = ""):
+    # Interactive sandbox. With `snapshot`, runs offscreen for `frames` frames
+    # and saves the last one (control panel included) to that PNG instead.
     import time
     init_scene()
     clip_axis[None] = 1          # default cross-section along Y
     clip_pos[None] = 0.5
-    res = (1280, 800)
-    window = ti.ui.Window("CRUCIBLE", res, vsync=False)  # uncapped = snappier
+    # the window must match the screen-space buffers blitted by set_image
+    window = ti.ui.Window("CRUCIBLE", (SS_W, SS_H), vsync=False,  # uncapped
+                          show_window=not snapshot)
     canvas = window.get_canvas()
     scene = window.get_scene()
     camera = ti.ui.Camera()
@@ -1577,22 +1599,28 @@ def run_gui(frames: int):
     brush_r = 0.10
     container_mode = 0           # 0 = box, 1 = round (live container shape)
     quality = 1                  # 0 fast / 1 balanced / 2 pretty (substeps+blur)
-    # quality -> (substeps per frame, render blur passes). More substeps = more
-    # sim-time/frame = livelier/faster motion but lower FPS.
-    QUALITY = [(6, 2), (9, 4), (13, 5)]
+    # quality -> (substep multiplier, render blur passes). Substeps scale the
+    # scene's own count (sized to its stiffest material), so "balanced" runs
+    # exactly SUBSTEPS. More substeps = more sim-time/frame = livelier motion
+    # but lower FPS; dt itself never changes, so stability is unaffected.
+    QUALITY = [(0.67, 2), (1.0, 4), (1.45, 5)]
     flip_val = FLIP_LIQUID       # live water slipperiness (FLIP ratio)
     throw_gain = 25.0            # cursor drag -> spawn velocity (add tool)
     force_gain = 40.0            # cursor drag -> push impulse  (force tool)
-    emit_rate = 600.0           # particles/frame per emitter
+    emit_rate = 600.0            # particles/frame per emitter
+    heat_rate = 60.0             # degrees/frame added by the heat tool (<0 cools)
     fallback_h = 0.5             # y-plane used only when the ray hits nothing
-    tool = 0                     # 0=add 1=delete 2=force 3=emitter 4=drain
+    tool = 0                     # 0=add 1=delete 2=force 3=emitter 4=drain 5=heat
     spawn_idx = 0
     SPAWN_MATS = [WATER, WATER_C, WATER_P, JELLY]
     SPAWN_NAMES = ["water blue", "water teal", "water violet", "jelly"]
     TOOL_NAMES = ["add", "delete", "force", "emitter", "drain"]
+    if HEAT_ON:                  # heat only does anything where it's simulated
+        TOOL_NAMES.append("heat")
     # cursor/marker colours per tool
     TOOL_COL = [(0.3, 0.8, 1.0), (1.0, 0.2, 0.2), (0.6, 1.0, 0.6),
-                (0.2, 1.0, 0.4), (0.8, 0.4, 1.0)]
+                (0.2, 1.0, 0.4), (0.8, 0.4, 1.0), (1.0, 0.55, 0.1)]
+    TOOL_KEYS = [str(k + 1) for k in range(len(TOOL_NAMES))]
     emitters = []                # list of [pos(np3), radius, mat]
     drains = []                  # list of [pos(np3), radius]
     save_path = "scene.npz"
@@ -1609,20 +1637,26 @@ def run_gui(frames: int):
     lmb_prev = False             # for click-edge detection (emitter/drain place)
     WORLD_UP = np.array([0.0, 1.0, 0.0], np.float32)
 
+    def reset():
+        init_scene()
+        emitters.clear()
+        drains.clear()
+
     frame = 0
-    while window.running and (frames <= 0 or frame < frames):
+    quit_requested = False
+    while window.running and not quit_requested and (frames <= 0 or frame < frames):
         # --- discrete key presses ------------------------------------------
         for e in window.get_events(ti.ui.PRESS):
             if e.key == ti.ui.SPACE:
                 paused = not paused
             elif e.key == 'r':
-                init_scene(); emitters.clear(); drains.clear()
+                reset()
             elif e.key == 'm':
                 order = ["fluid", "surface", "particles"]
                 render_mode = order[(order.index(render_mode) + 1) % 3]
             elif e.key == 'c':
                 clip = not clip
-            elif e.key in ('1', '2', '3', '4', '5'):
+            elif e.key in TOOL_KEYS:
                 tool = int(e.key) - 1
             elif e.key == ti.ui.TAB:
                 spawn_idx = (spawn_idx + 1) % len(SPAWN_MATS)
@@ -1633,7 +1667,7 @@ def run_gui(frames: int):
             elif e.key == ']':
                 brush_r = min(0.30, brush_r + 0.02)
             elif e.key == ti.ui.ESCAPE:
-                break
+                quit_requested = True
 
         # --- camera: RMB drag = orbit, MMB drag = pan, =/- (or Up/Down) zoom
         cx, cy = window.get_cursor_pos()
@@ -1675,7 +1709,7 @@ def run_gui(frames: int):
             gui.text(f"{fps:5.1f} FPS   {'PAUSED' if paused else 'running'}")
             paused = gui.checkbox("pause (space)", paused)
             if gui.button("reset scene (r)"):
-                init_scene()
+                reset()
             _modes = ["fluid", "surface", "particles"]
             ridx = gui.slider_int("render 0fluid 1surf 2pts (m)",
                                   _modes.index(render_mode), 0, 2)
@@ -1694,7 +1728,7 @@ def run_gui(frames: int):
             ax = gui.slider_int("axis 0=x 1=y 2=z", clip_axis[None], 0, 2)
             clip_axis[None] = ax
             clip_pos[None] = gui.slider_float("position", clip_pos[None], 0.0, 1.0)
-            gui.text("--- tool (keys 1-5) ---")
+            gui.text(f"--- tool (keys 1-{len(TOOL_NAMES)}) ---")
             tool = gui.slider_int(f"tool = {TOOL_NAMES[tool]}", tool, 0,
                                   len(TOOL_NAMES) - 1)
             # Tool-specific control comes first so it is always visible:
@@ -1719,6 +1753,10 @@ def run_gui(frames: int):
             elif tool == 4:
                 gui.text("  DRAIN - click to place a sink")
                 gui.text(f"  drains: {len(drains)}   (x = clear all)")
+            elif tool == 5:
+                gui.text("  HEAT - hold to heat (negative rate cools)")
+                heat_rate = gui.slider_float("heat rate", heat_rate,
+                                             -200.0, 200.0)
             else:
                 gui.text("  DELETE removes material in the sphere")
             brush_r = gui.slider_float("brush radius [ ]", brush_r, 0.02, 0.3)
@@ -1731,7 +1769,8 @@ def run_gui(frames: int):
         clip_on[None] = 1 if clip else 0
         flip_ratio[None] = flip_val      # live water slipperiness from the slider
         container_shape[None] = container_mode
-        n_sub, blur_n[None] = QUALITY[quality]   # quality -> substeps + blur
+        sub_mult, blur_n[None] = QUALITY[quality]   # quality -> substeps + blur
+        n_sub = max(1, round(SUBSTEPS * sub_mult))
 
         # --- simulate + run placed emitters/drains --------------------------
         if not paused:
@@ -1795,6 +1834,8 @@ def run_gui(frames: int):
                 emitters.append([hover.copy(), brush_r, SPAWN_MATS[spawn_idx]])
             elif tool == 4 and lmb_edge:     # place drain
                 drains.append([hover.copy(), brush_r])
+            elif tool == 5:                  # heat / cool
+                heat_brush(bc, brush_r, heat_rate)
             prev_hit = hover
         else:
             prev_hit = None
@@ -1827,7 +1868,11 @@ def run_gui(frames: int):
             _render_scene(scene, camera, render_mode)
             canvas.set_background_color((0.05, 0.05, 0.08))
             canvas.scene(scene)
-        window.show()
+        if snapshot and frame + 1 >= frames:
+            window.save_image(snapshot)
+            print(f"  saved {snapshot}")
+        elif not snapshot:
+            window.show()
 
         now = time.perf_counter()
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - last_t, 1e-6))
@@ -1903,43 +1948,9 @@ def run_spawn_test(path: str) -> int:
 
 
 def run_panel_shot(path: str):
-    # Render one frame WITH the control panel (in add mode) to a PNG, to verify
-    # the panel layout — including the material picker — is fully visible.
-    init_scene()
-    window = ti.ui.Window("panel", (1280, 800), vsync=False, show_window=False)
-    canvas = window.get_canvas()
-    scene = window.get_scene()
-    camera = ti.ui.Camera()
-    camera.position(1.7, 1.1, 1.7); camera.lookat(0.5, 0.35, 0.5); camera.up(0, 1, 0)
-    gui = window.get_gui()
-    with gui.sub_window("CRUCIBLE", 0.0, 0.0, 0.30, 0.95):
-        gui.text(f"scene: {SCENE}   sim {N_SIM} + pool {N_POOL}")
-        gui.text(" 30.0 FPS   running")
-        gui.checkbox("pause (space)", False)
-        gui.button("reset scene (r)")
-        gui.checkbox("surface render (m)", True)
-        gui.text("--- cross-section (c) ---")
-        gui.checkbox("clip plane on", False)
-        gui.slider_int("axis 0=x 1=y 2=z", 1, 0, 2)
-        gui.slider_float("position", 0.5, 0.0, 1.0)
-        gui.text("--- brush tool ---")
-        gui.checkbox("apply brush (hold)", False)
-        gui.slider_int("tool: 0 heat  1 add  2 delete", 1, 0, 2)
-        gui.slider_int("material (0-5)", 0, 0, 5)
-        gui.text("  ADD: water   (free pool 250000)")
-        gui.slider_float("brush x", 0.5, 0.0, 1.0)
-        gui.slider_float("brush y", 0.5, 0.0, 1.0)
-        gui.slider_float("brush z", 0.5, 0.0, 1.0)
-        gui.slider_float("brush radius", 0.1, 0.02, 0.3)
-        gui.text("--- scene file ---")
-        gui.button("save scene")
-        gui.button("load scene")
-    scene.set_camera(camera)
-    _render_scene(scene, camera, "surface")
-    canvas.set_background_color((0.05, 0.05, 0.08))
-    canvas.scene(scene)
-    window.save_image(path)
-    print(f"  saved {path}")
+    # Render one frame of the real GUI (control panel in add mode) to a PNG, to
+    # verify the panel layout — including the material picker — is fully visible.
+    run_gui(1, snapshot=path)
 
 
 def run_bench(frames: int):
@@ -2051,8 +2062,10 @@ def main():
                         help="override substep size (0 = scene default)")
     parser.add_argument("--substeps", type=int, default=0,
                         help="override substeps per frame (0 = scene default)")
-    parser.add_argument("--particles", type=int, default=N_PARTICLES,
-                        help="particle count (fewer = faster, coarser); sizes fields at startup")
+    parser.add_argument("--particles", type=int, default=N_SIM,
+                        help="scene particle count (fewer = faster, coarser); sizes fields at startup")
+    parser.add_argument("--pool", type=int, default=N_POOL,
+                        help="free particles reserved for the add/emitter tools; sizes fields at startup")
     parser.add_argument("--grid", type=int, default=N_GRID,
                         help="sim grid resolution per axis (sizes fields at startup)")
     parser.add_argument("--render-grid", type=int, default=NR,
@@ -2091,7 +2104,7 @@ def main():
     RENDER_MODE = args.render
     RHO_ISO_FRAC = args.iso
     DT, SUBSTEPS = scene_timestep(SCENE)
-    HEAT_ON = False   # heat physics removed
+    HEAT_ON = SCENE in HEAT_SCENES
     if args.dt > 0.0:
         DT = args.dt
     if args.substeps > 0:

@@ -10,3 +10,8 @@ build/
 dist/
 *.log
 .env
+
+# runtime output
+imgui.ini
+scene.npz
+._renderbench.png
