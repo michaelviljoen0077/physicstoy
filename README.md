@@ -4,8 +4,8 @@ A real-time 3D physics sandbox built on **MLS-MPM** (GPU, via Taichi) — a
 physically-grounded cousin of *The Powder Toy* where a curated set of materials
 flow, pile, deform, and transform into one another through a shared heat field.
 
-See [`spec.md`](spec.md) for the full design (if present); this README tracks
-what actually runs.
+See [`spec.md`](spec.md) for the full design; this README tracks what actually
+runs.
 
 ## Status
 
@@ -26,21 +26,33 @@ what actually runs.
 > Python 3.9.13 in `.venv/`.
 
 ```powershell
-# from the project root
+# from the project root (Windows)
 py -3.9 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+```bash
+# Linux / macOS
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+The commands below use the Windows venv path; on Linux/macOS substitute
+`.venv/bin/python src/mpm_fluid.py`.
+
 ## Run
 
 ```powershell
-# Interactive GGUI window (orbit camera: hold right mouse + WASD)
-.\.venv\Scripts\python.exe src\mpm_fluid.py                 # default: drop scene
+# Interactive GGUI window
+.\.venv\Scripts\python.exe src\mpm_fluid.py                 # default: pool sandbox
 
-# Headless gate — no window; asserts no NaN, bounded velocity, correct layering
-.\.venv\Scripts\python.exe src\mpm_fluid.py --headless --frames 600
+# Headless gate — no window; asserts no NaN, bounded velocity, and the scene's
+# own success criterion (layering, slump, reaction, ...)
+.\.venv\Scripts\python.exe src\mpm_fluid.py --headless --scene drop --frames 600
 
 # Scenes:
+.\.venv\Scripts\python.exe src\mpm_fluid.py --scene pool    # calm water tank to play in (default)
+.\.venv\Scripts\python.exe src\mpm_fluid.py --scene empty   # blank tank, build with the add tool
 .\.venv\Scripts\python.exe src\mpm_fluid.py --scene drop    # heavy ball sinks through light pool
 .\.venv\Scripts\python.exe src\mpm_fluid.py --scene jelly   # elastic cube wobbles and bounces
 .\.venv\Scripts\python.exe src\mpm_fluid.py --scene sand    # granular column slumps into a pile
@@ -50,32 +62,46 @@ py -3.9 -m venv .venv
 .\.venv\Scripts\python.exe src\mpm_fluid.py --scene mixed   # why MPM can't demix co-located fluids
 ```
 
-`--arch cpu` falls back to CPU if needed; default is `cuda`.
+`--arch cpu` (or `vulkan`) if CUDA isn't available; default is `cuda`.
+Heat (temperature diffusion + transformations) is compiled in only for the
+`lava` and `melt` scenes.
 
 ### Interactive controls (GGUI window)
 
-A control panel (top-left) plus keyboard shortcuts:
+A control panel (left) plus keyboard/mouse shortcuts:
 
-| Key | Action | Panel |
-|---|---|---|
-| `space` | pause / resume | pause checkbox |
-| `r` | reset scene | reset button |
-| `m` | toggle surface / particle render | checkbox |
-| `c` | toggle clip plane | clip checkbox + axis/position sliders |
-| right-drag + WASD | orbit / fly camera | — |
+| Input | Action |
+|---|---|
+| right-drag | orbit camera |
+| middle-drag | pan camera |
+| `Up` / `Down` (or zoom slider) | zoom |
+| left-click / drag in the view | use the current tool |
+| `1`–`5` (`6` in heat scenes) | pick tool: add, delete, force, emitter, drain, (heat) |
+| `Tab` | cycle add/emitter material (blue / teal / violet water, jelly) |
+| `[` / `]` | shrink / grow brush |
+| `x` | clear all emitters and drains |
+| `space` | pause / resume |
+| `r` | reset scene |
+| `m` | cycle render mode: fluid → surface → particles |
+| `c` | toggle cross-section clip plane |
+| `Esc` | quit |
+
+Tools are **depth-picked**: the brush lands on the fluid surface under the
+cursor (in fluid render mode), otherwise on a fixed-height plane.
+- **add** — spawn material from a free particle **pool** (`--pool N`, default
+  250k); drag while adding to throw it.
+- **delete** — return material inside the brush to the pool.
+- **force** — swipe to push, stir or knock things over.
+- **emitter / drain** — click to place a persistent source / sink.
+- **heat** (lava/melt scenes only) — hold to heat; a negative rate cools.
+
+The panel also has **quality** (scales substeps per frame + render blur),
+**slipperiness** (the FLIP/PIC blend for liquids) and a **box/round container**.
 
 The **cross-section plane** (clip) hides everything past an axis-aligned plane so
 you can see *inside* the volume — the practical answer to "placing/seeing things
 in a 3D box is awkward." **Save/load** writes the full particle state to
-`scene.npz`.
-
-The **brush tool** (panel) is **mouse-driven** — left-click in the view to apply
-it where the cursor ray meets the "brush height" plane (slider). Three modes:
-- **heat** — add/remove heat (melt ice, boil water, freeze); acts only in
-  lava/melt scenes where heat is simulated.
-- **add** — spawn a chosen material (water/ice/lava/sand/jelly/stone) by pulling
-  from a free particle **pool** (`--pool N`, default 250k).
-- **delete** — return material in the brush back to the pool.
+`scene.npz` (it only loads into a run with the same `--particles`/`--pool`).
 
 ```powershell
 # headless save/load round-trip check; cross-section screenshots:
@@ -99,7 +125,7 @@ it. Approximate sim cost (RTX 4080, 64³ grid, surface render):
 | lava  | 800k | 11 | ~30 |
 
 Knobs: `--particles N` (fewer = faster, coarser), `--substeps N`, `--dt F`,
-`--render particles` (skips the mesh), `--bench` (per-stage timing).
+`--render particles` (skips shading), `--bench` (per-stage timing).
 
 **Surface render gotcha (fixed):** GGUI re-uploads the *entire* mesh vertex
 buffer every frame, ignoring `vertex_count`. An oversized buffer
@@ -127,10 +153,10 @@ mass-weighted grid value would underflow without a full rescale.
 ### Rendering
 
 ```powershell
-# Smooth isosurface mesh (default) vs raw particle cloud
+# Screen-space fluid (default), isosurface mesh, or raw particle cloud
 .\.venv\Scripts\python.exe src\mpm_fluid.py --scene lava --render surface
 .\.venv\Scripts\python.exe src\mpm_fluid.py --scene lava --render particles
-.\.venv\Scripts\python.exe src\mpm_fluid.py --scene drop --iso 4.0     # tune surface tightness
+.\.venv\Scripts\python.exe src\mpm_fluid.py --scene drop --render surface --iso 0.3  # iso = fraction of peak density
 
 # Save a PNG (no interactive window) to inspect the look
 .\.venv\Scripts\python.exe src\mpm_fluid.py --screenshot shot.png --scene lava --frames 8
@@ -144,7 +170,7 @@ Each particle carries a `material_id` selecting its rest density (encoded as
 per-particle **mass**), colour, and stiffness. Density-driven layering is then
 emergent — nothing scripted.
 
-The default **drop** scene releases a ball of heavy (orange) fluid above a pool
+The **drop** scene releases a ball of heavy (orange) fluid above a pool
 of light (blue) fluid. It plunges in, mushrooms downward, and **settles below
 the light fluid** — verified by the headless gate (heavy mean-height ends clearly
 below light, velocities bounded, no NaNs). ~800k particles keep the filled region
